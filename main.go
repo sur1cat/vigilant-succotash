@@ -19,6 +19,7 @@ func main() {
 	go startTCPServer()
 
 	http.HandleFunc("/send", handleSendCommand)
+	http.HandleFunc("/ping", Pong)
 	log.Println("HTTP listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
@@ -83,4 +84,9 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 	conn.Write(payload)
 	fmt.Fprintf(w, "Sent: %x", payload)
+}
+
+func Pong(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("pong"))
 }
