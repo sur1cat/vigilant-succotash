@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"server/internal/protocol"
 	"sync"
-	_ "time"
 )
 
 var (
-	conn net.Conn
-	mu   sync.Mutex
+	connections = make(map[string]net.Conn) // Хранит соединения по StationID
+	mu          sync.RWMutex
 )
 
 func main() {
@@ -39,51 +38,80 @@ func startTCPServer() {
 			continue
 		}
 		log.Println("New station connected")
-
-		mu.Lock()
-		conn = c
-		mu.Unlock()
-
 		go handleConnection(c)
 	}
 }
 
 func handleConnection(c net.Conn) {
-	defer c.Close()
+	defer func() {
+		c.Close()
+		mu.Lock()
+		for id, conn := range connections {
+			if conn == c {
+				delete(connections, id)
+				log.Printf("Station %s disconnected", id)
+			}
+		}
+		mu.Unlock()
+	}()
+
 	buf := make([]byte, 1024)
+	var stationID string
 	for {
 		n, err := c.Read(buf)
 		if err != nil {
-			log.Println("Connection closed")
+			log.Printf("Connection error: %v", err)
 			return
 		}
 		log.Printf("Received: %x\n", buf[:n])
 
-		resp := protocol.HandleIncoming(buf[:n])
+		resp, id := protocol.HandleIncoming(buf[:n])
+		if id != "" && stationID == "" {
+			stationID = id
+			mu.Lock()
+			connections[stationID] = c
+			mu.Unlock()
+			log.Printf("Station registered with ID: %s", stationID)
+		}
 		if resp != nil {
-			c.Write(resp)
+			_, err := c.Write(resp)
+			if err != nil {
+				log.Printf("Write error: %v", err)
+				return
+			}
+			log.Printf("Sent response: %x", resp)
 		}
 	}
 }
 
 func handleSendCommand(w http.ResponseWriter, r *http.Request) {
+	stationID := r.URL.Query().Get("stationID")
 	cmd := r.URL.Query().Get("cmd")
 	token := r.URL.Query().Get("token")
 	slot := r.URL.Query().Get("slot")
 
-	if conn == nil {
-		http.Error(w, "No device connected", http.StatusBadRequest)
+	mu.RLock()
+	conn, exists := connections[stationID]
+	mu.RUnlock()
+
+	if !exists {
+		http.Error(w, fmt.Sprintf("No device connected with ID %s", stationID), http.StatusBadRequest)
 		return
 	}
+
 	payload := protocol.CreateCommand(cmd, token, slot)
 	if payload == nil {
 		http.Error(w, "Invalid command or parameters", http.StatusBadRequest)
 		return
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	conn.Write(payload)
-	fmt.Fprintf(w, "Sent: %x", payload)
+
+	_, err := conn.Write(payload)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to send command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "Sent to %s: %x", stationID, payload)
 }
 
 func Pong(w http.ResponseWriter, r *http.Request) {
