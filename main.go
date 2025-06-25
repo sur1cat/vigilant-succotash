@@ -1,40 +1,48 @@
 package main
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"server/internal/protocol"
+	"strings"
 	"sync"
 )
 
-type StationInfo struct {
-	Conn      net.Conn
-	Token     string
-	StationID string
+var (
+	connections = make(map[string]net.Conn) // Хранит соединения по StationID
+	mu          sync.RWMutex
+)
+
+type SendCommandRequest struct {
+	StationID string `json:"station_id"`
+	Cmd       string `json:"cmd"`
+	Token     string `json:"token"`
+	Slot      string `json:"slot,omitempty"`
 }
 
-var (
-	stations = make(map[string]*StationInfo) // Хранит информацию о станциях по StationID
-	mu       sync.RWMutex
-)
+type StationInfo struct {
+	StationID string `json:"stationID"`
+	Status    string `json:"status"`
+	Token     string `json:"token"`
+}
+
+type StationsResponse struct {
+	Count    int           `json:"count"`
+	Stations []StationInfo `json:"stations"`
+}
 
 func main() {
 	go startTCPServer()
 
 	http.HandleFunc("/send", handleSendCommand)
 	http.HandleFunc("/stations", handleListStations)
-	http.HandleFunc("/ping", Pong)
+	http.HandleFunc("/ping", handlePong)
 
 	log.Println("HTTP server listening on :8080")
-	log.Println("Available endpoints:")
-	log.Println("  GET /stations - list all connected stations with tokens")
-	log.Println("  GET /send?stationID=<id>&cmd=<command>&slot=<slot> - send command (token auto-selected)")
-	log.Println("  GET /ping - health check")
-
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -61,17 +69,18 @@ func handleConnection(c net.Conn) {
 	defer func() {
 		c.Close()
 		mu.Lock()
-		for id, station := range stations {
-			if station.Conn == c {
-				delete(stations, id)
+		for id, conn := range connections {
+			if conn == c {
+				delete(connections, id)
 				log.Printf("Station %s disconnected", id)
+				break
 			}
 		}
 		mu.Unlock()
 	}()
 
 	buf := make([]byte, 1024)
-	var currentStation *StationInfo
+	var stationID string
 
 	for {
 		n, err := c.Read(buf)
@@ -79,28 +88,15 @@ func handleConnection(c net.Conn) {
 			log.Printf("Connection error: %v", err)
 			return
 		}
-		log.Printf("Received from %s: %x", getStationID(c), buf[:n])
+		log.Printf("Received from station: %x", buf[:n])
 
-		resp, stationID := protocol.HandleIncoming(buf[:n])
-
-		// Если получили Station ID (это login), сохраняем информацию о станции
-		if stationID != "" && currentStation == nil {
-			// Извлекаем токен из пакета логина
-			if len(buf) >= 9 {
-				token := hex.EncodeToString(buf[5:9])
-
-				currentStation = &StationInfo{
-					Conn:      c,
-					Token:     token,
-					StationID: stationID,
-				}
-
-				mu.Lock()
-				stations[stationID] = currentStation
-				mu.Unlock()
-
-				log.Printf("Station registered: ID=%s, Token=%s", stationID, token)
-			}
+		resp, id := protocol.HandleIncoming(buf[:n])
+		if id != "" && stationID == "" {
+			stationID = id
+			mu.Lock()
+			connections[stationID] = c
+			mu.Unlock()
+			log.Printf("Station registered with ID: %s", stationID)
 		}
 
 		if resp != nil {
@@ -109,47 +105,59 @@ func handleConnection(c net.Conn) {
 				log.Printf("Write error: %v", err)
 				return
 			}
-			log.Printf("Sent response to %s: %x", getStationID(c), resp)
+			log.Printf("Sent response to %s: %x", stationID, resp)
 		}
 	}
-}
-
-func getStationID(conn net.Conn) string {
-	mu.RLock()
-	defer mu.RUnlock()
-	for id, station := range stations {
-		if station.Conn == conn {
-			return id
-		}
-	}
-	return "unknown"
 }
 
 func handleSendCommand(w http.ResponseWriter, r *http.Request) {
-	stationID := r.URL.Query().Get("stationID")
-	cmd := r.URL.Query().Get("cmd")
-	slot := r.URL.Query().Get("slot")
+	w.Header().Set("Content-Type", "application/json")
 
-	// Позволяем пользователю переопределить токен, если нужно
-	tokenParam := r.URL.Query().Get("token")
+	var req SendCommandRequest
+	var stationID, cmd, token, slot string
 
-	mu.RLock()
-	station, exists := stations[stationID]
-	mu.RUnlock()
+	// Поддерживаем как JSON, так и URL параметры
+	if r.Header.Get("Content-Type") == "application/json" || strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error reading request body: %v", err), http.StatusBadRequest)
+			return
+		}
 
-	if !exists {
-		http.Error(w, fmt.Sprintf("No station connected with ID: %s", stationID), http.StatusBadRequest)
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		stationID = req.StationID
+		cmd = req.Cmd
+		token = req.Token
+		slot = req.Slot
+	} else {
+		// URL параметры (поддерживаем оба варианта названий)
+		stationID = r.URL.Query().Get("stationID")
+		if stationID == "" {
+			stationID = r.URL.Query().Get("station_id")
+		}
+		cmd = r.URL.Query().Get("cmd")
+		token = r.URL.Query().Get("token")
+		slot = r.URL.Query().Get("slot")
+	}
+
+	log.Printf("Send command request: stationID=%s, cmd=%s, token=%s, slot=%s", stationID, cmd, token, slot)
+
+	if stationID == "" || cmd == "" || token == "" {
+		http.Error(w, "Missing required parameters: station_id/stationID, cmd, token", http.StatusBadRequest)
 		return
 	}
 
-	// Используем токен из параметра или сохраненный токен станции
-	token := tokenParam
-	if token == "" {
-		token = station.Token
-	}
+	mu.RLock()
+	conn, exists := connections[stationID]
+	mu.RUnlock()
 
-	if token == "" {
-		http.Error(w, "No token available for this station", http.StatusBadRequest)
+	if !exists {
+		log.Printf("Station %s not found in connections. Available stations: %v", stationID, getConnectedStationIDs())
+		http.Error(w, fmt.Sprintf("No station connected with ID: %s", stationID), http.StatusBadRequest)
 		return
 	}
 
@@ -159,47 +167,59 @@ func handleSendCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := station.Conn.Write(payload)
+	log.Printf("Sending command to station %s: %x", stationID, payload)
+	_, err := conn.Write(payload)
 	if err != nil {
+		log.Printf("Failed to send command to station %s: %v", stationID, err)
 		http.Error(w, fmt.Sprintf("Failed to send command: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	response := map[string]interface{}{
 		"status":    "success",
+		"message":   fmt.Sprintf("Command sent to station %s", stationID),
 		"stationID": stationID,
 		"command":   cmd,
-		"token":     token,
-		"payload":   hex.EncodeToString(payload),
-		"slot":      slot,
+		"payload":   fmt.Sprintf("%x", payload),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
 func handleListStations(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
 	mu.RLock()
-	stationList := make([]map[string]string, 0, len(stations))
-	for id, station := range stations {
-		stationList = append(stationList, map[string]string{
-			"stationID": id,
-			"token":     station.Token,
-			"status":    "connected",
+	stations := make([]StationInfo, 0, len(connections))
+	for stationID := range connections {
+		stations = append(stations, StationInfo{
+			StationID: stationID,
+			Status:    "connected",
+			Token:     "11223344", // Можно хранить реальные токены если нужно
 		})
 	}
 	mu.RUnlock()
 
-	response := map[string]interface{}{
-		"count":    len(stationList),
-		"stations": stationList,
+	response := StationsResponse{
+		Count:    len(stations),
+		Stations: stations,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
-func Pong(w http.ResponseWriter, r *http.Request) {
+func handlePong(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("pong"))
+}
+
+func getConnectedStationIDs() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	ids := make([]string, 0, len(connections))
+	for id := range connections {
+		ids = append(ids, id)
+	}
+	return ids
 }
