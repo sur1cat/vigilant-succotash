@@ -21,10 +21,14 @@ func validateChecksum(data []byte) bool {
 		return false
 	}
 	expected := data[4]
+	// Checksum вычисляется для payload (данные после Token)
 	if len(data) > 9 {
 		calculated := xorChecksum(data[9:])
+		log.Printf("Checksum validation: expected=0x%02x, calculated=0x%02x", expected, calculated)
 		return expected == calculated
 	}
+	// Для пакетов без payload checksum должен быть 0x00
+	log.Printf("No payload, checksum should be 0x00, got 0x%02x", expected)
 	return expected == 0x00
 }
 
@@ -38,7 +42,7 @@ func CreateCommand(cmd string, tokenHex string, slotStr string) []byte {
 	buf := &bytes.Buffer{}
 	cmdByte := byte(0x00)
 	var payload []byte
-	var packLen uint16 = 7
+	var packLen uint16 = 7 // Базовая длина: PackLen(2) + Cmd(1) + Version(1) + CheckSum(1) + Token(4)
 
 	switch cmd {
 	case "heartbeat":
@@ -136,9 +140,12 @@ func HandleIncoming(data []byte) ([]byte, string) {
 	}
 
 	packLen := binary.BigEndian.Uint16(data[0:2])
+	log.Printf("PackLen from header: %d, actual data length: %d", packLen, len(data))
+
+	// PackLen включает в себя весь пакет, включая поле PackLen
 	if int(packLen) != len(data) {
 		log.Printf("Packet length mismatch: expected %d, got %d", packLen, len(data))
-		return nil, ""
+		// Не возвращаем ошибку, продолжаем обработку
 	}
 
 	if !validateChecksum(data) {
@@ -157,6 +164,8 @@ func HandleIncoming(data []byte) ([]byte, string) {
 	switch cmd {
 	case 0x60: // Login
 		log.Println("Received login")
+		log.Printf("Full packet: %x", data)
+
 		if len(data) >= 21 { // Минимальная длина для Login
 			rand := data[9:13]
 			magic := binary.BigEndian.Uint16(data[13:15])
@@ -173,6 +182,17 @@ func HandleIncoming(data []byte) ([]byte, string) {
 					stationID = string(boxIDBytes)
 				}
 				log.Printf("Station ID: %s", stationID)
+
+				// Проверяем есть ли еще данные (ReqDataLen + ReqData)
+				remainingPos := 17 + int(boxIDLen)
+				if len(data) > remainingPos+2 {
+					reqDataLen := binary.BigEndian.Uint16(data[remainingPos : remainingPos+2])
+					log.Printf("ReqDataLen: %d", reqDataLen)
+					if len(data) >= remainingPos+2+int(reqDataLen) {
+						reqData := data[remainingPos+2 : remainingPos+2+int(reqDataLen)]
+						log.Printf("ReqData: %x", reqData)
+					}
+				}
 			}
 		}
 
